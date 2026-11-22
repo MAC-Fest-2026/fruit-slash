@@ -13,10 +13,16 @@
   // smallest screens while letting phones scale down to ~252 px/s.
   var SLASH_SPEED_FACTOR = 0.7; // x min(canvasWidth, canvasHeight) per second
   var SLASH_CHAIN_WINDOW_MS = 150; // slashes this close together = one swipe
-  var MAX_MISSES = 3;
+  var MAX_MISSES = 3; // 3 misses ends the game; completing a round with <=2 advances
   var HIGH_SCORE_KEY = 'fruitSlashHighScore';
-  var GRAVITY_FACTOR = 1.15; // x canvas height, px/s^2 (lowered ~28%: slower arcs, longer hang time)
+  var GRAVITY_FACTOR = 1.6; // x canvas height, px/s^2 (original fast fall; hang time ~2.1s)
   var FRUIT_SCALE = 1.45; // fruit + bomb radius multiplier (bigger, juicier targets)
+  var ANNOUNCE_MS = 1000; // wave banner shows for ~1s before the wave launches
+  // Rounds, not slower fruit, make the game last longer: each round has a
+  // fixed quota of fruits to clear. Round 1 = 15 fruits, +5 per round.
+  // Wave sizes: round 1 waves carry 3 fruits, +2 per round, capped at 20.
+  function roundQuota(n) { return 10 + 5 * n; }
+  function waveSizeForRound(n) { return Math.min(20, 3 + 2 * (n - 1)); }
 
   function slashSpeedThreshold(w, h) {
     // Rounded to whole px/s: 0.7 is not exact in binary, so 0.7*360 would
@@ -39,38 +45,35 @@
   function comboBonus(chainLength) { return Math.max(0, chainLength - 1); }
   function scoreForSwipe(n) { return n + comboBonus(n); }
 
-  // Difficulty ramp (PRD §3): first 10 s gentle, then faster, bigger groups,
-  // more bombs. No timer on the round — it ends only by misses or a bomb.
-  // Wave-based spawning: a wave launches several fruits at once, then a
-  // short gap (spawnInterval) before the next wave. Waves get bigger and a
-  // bit faster the longer the round survives.
-  function difficultyAt(t) {
-    var gentle = t < 10;
-    var since = Math.max(0, t - 10);
+  // Difficulty per ROUND (not per second): each round is harder than the
+  // last — bigger waves, slightly faster launches, more bombs, shorter gaps.
+  // Gravity stays at 1.6 every round; rounds get longer because the quota
+  // grows, not because the fruit slows down.
+  function difficultyForRound(n) {
     return {
-      spawnInterval: gentle ? 1.0 : Math.max(0.8, 1.0 - since * 0.006),
-      groupSize: gentle ? 2 : Math.min(6, 2 + Math.floor(since / 15)),
-      bombChance: gentle ? 0.05 : Math.min(0.30, 0.05 + since * 0.004),
-      launchBoost: 1 + Math.min(0.25, t * 0.003)
+      spawnInterval: Math.max(0.7, 1.2 - 0.08 * (n - 1)),
+      waveSize: waveSizeForRound(n),
+      bombChance: Math.min(0.30, 0.05 + 0.04 * (n - 1)),
+      launchBoost: 1 + Math.min(0.25, 0.05 * (n - 1))
     };
   }
 
-  // Plan one wave: how many bodies launch, and how many of them are bombs.
-  // Pure (rng injectable) so the harness can test wave composition.
-  // - Early waves are 2-3 bodies; later waves grow to 4-6 (see difficultyAt).
-  // - Bombs are capped at 2 per wave, and most later waves carry at least
-  //   one bomb (a second-chance roll when none was rolled).
-  function planWave(t, rng) {
-    var d = difficultyAt(t);
+  // Plan one wave for round n: how many quota fruits launch, and how many
+  // extra bombs come along. Pure (rng injectable) so the harness can test it.
+  // - Fruit count is min(wave size for the round, quota still remaining).
+  // - Bombs are extra bodies on top of the fruit quota, capped at 2 per wave.
+  // - From round 2, a wave that rolled no bomb has a 70% second chance of
+  //   carrying exactly one bomb, so most later waves carry a bomb.
+  function planWave(roundNum, fruitsRemaining, rng) {
+    var d = difficultyForRound(roundNum);
     var r = rng || Math.random;
-    var total = d.groupSize;
-    if (t < 10 && r() < 0.5) total += 1; // early waves vary 2-3
+    var fruits = Math.max(0, Math.min(d.waveSize, fruitsRemaining));
     var bombs = 0;
-    for (var i = 0; i < total; i++) {
+    for (var i = 0; i < fruits; i++) {
       if (bombs < 2 && r() < d.bombChance) bombs++;
     }
-    if (t >= 20 && bombs === 0 && r() < 0.7) bombs = 1;
-    return { total: total, bombs: bombs, fruits: total - bombs };
+    if (roundNum >= 2 && bombs === 0 && fruits > 0 && r() < 0.7) bombs = 1;
+    return { total: fruits + bombs, bombs: bombs, fruits: fruits };
   }
 
   // Does the segment (x1,y1)-(x2,y2) pass through the circle? Used so a
@@ -113,11 +116,30 @@
   }
 
   /* ---- round state ---- */
-  function newRound() {
+  // A "round" is one quota of fruits to clear. Score and total slashed
+  // carry forward across rounds (cumulative); slashed / misses / bestCombo
+  // are per round. `launched` counts quota fruits launched, `resolved`
+  // counts quota fruits finished (slashed or missed). Bombs are extra and
+  // touch neither count.
+  function newRound(roundNum, prev) {
+    var n = roundNum || 1;
     return {
-      score: 0, slashed: 0, misses: 0, bestCombo: 0,
-      chain: 0, lastSlashAt: -1e9, over: false, reason: null
+      round: n, quota: roundQuota(n), launched: 0, resolved: 0,
+      score: prev ? prev.score : 0, startScore: prev ? prev.score : 0,
+      slashed: 0, totalSlashed: prev ? prev.totalSlashed : 0,
+      misses: 0, bestCombo: 0,
+      chain: 0, lastSlashAt: -1e9, over: false, reason: null, complete: false
     };
+  }
+  // Every quota fruit launched and every one resolved (slashed or missed).
+  function isRoundComplete(round) {
+    return !round.over && round.launched >= round.quota && round.resolved >= round.launched;
+  }
+  // Complete with 2 or fewer misses advances to the next round. (3 misses
+  // sets over=true, so a complete round always has <=2 misses; the check is
+  // kept explicit so the rule is testable.)
+  function canAdvance(round) {
+    return isRoundComplete(round) && round.misses <= 2;
   }
   // Register one slashed fruit. Returns { points, chain, bonus }.
   function registerSlash(round, nowMs) {
@@ -126,6 +148,8 @@
     round.lastSlashAt = nowMs;
     round.chain = chain;
     round.slashed += 1;
+    round.totalSlashed += 1;
+    round.resolved += 1;
     var bonus = chain > 1 ? 1 : 0; // each extra fruit in the swipe adds +1
     round.score += 1 + bonus;
     if (chain > round.bestCombo) round.bestCombo = chain;
@@ -135,6 +159,7 @@
   function registerMiss(round) {
     if (round.over) return false;
     round.misses += 1;
+    round.resolved += 1;
     round.chain = 0;
     if (round.misses >= MAX_MISSES) { round.over = true; round.reason = 'misses'; return true; }
     return false;
@@ -408,9 +433,9 @@
     resize();
 
     /* ---------- state ---------- */
-    var state = 'start'; // start | loading | ready | playing | over
+    var state = 'start'; // start | loading | ready | playing | over | roundcomplete
     var mode = 'camera'; // camera | mouse (mouse = pointer fallback, works with touch too)
-    var round = newRound();
+    var round = newRound(1);
     var fruits = [], halves = [], particles = [];
     var trail = []; // recent fingertip points {x, y, t}
     var tip = { x: -999, y: -999, px: -999, py: -999, speed: 0, present: false };
@@ -430,14 +455,24 @@
     var ambient = [];
     var soundOn = true;
     var newBest = false;
+    var waveNum = 0; // waves launched this round
+    var pendingWave = null; // { wave, plan, at } — announced, not yet launched
+    var completeShown = false;
+    var completeAt = 0; // when to show the round-complete screen
+    var bestComboOverall = 0;
 
     function showScreen(name) {
-      ['start', 'loading', 'ready', 'result'].forEach(function (n) {
+      ['start', 'loading', 'ready', 'result', 'round-complete'].forEach(function (n) {
         var el = $('screen-' + n);
         if (el) el.classList.toggle('active', n === name);
       });
+      setHudActive(name === 'ready' || state === 'playing');
+    }
+    function setHudActive(on) {
       var hud = $('hud');
-      if (hud) hud.classList.toggle('active', name === 'ready' || state === 'playing');
+      if (hud) hud.classList.toggle('active', on);
+      var hr = $('hud-round');
+      if (hr) hr.classList.toggle('active', on);
     }
     function setStatus(text) { var el = $('loading-status'); if (el) el.textContent = text; }
     function setReadyHint(text) { var el = $('ready-hint'); if (el) el.textContent = text; }
@@ -484,9 +519,24 @@
     initAmbient();
 
     /* ---------- spawning ---------- */
-    function spawnGroup(t) {
-      var plan = planWave(t, Math.random);
-      // Shuffle bomb/fruit slots so bombs never launch from a fixed spot.
+    // Wave banner: before every wave launches, the player sees exactly how
+    // many fruits are coming ("WAVE 2 — 5 FRUITS INCOMING!") for ~1 second.
+    function showWaveBanner(wave, fruitCount) {
+      var b = $('wave-banner');
+      if (!b) return;
+      var t = $('wave-banner-title');
+      if (t) t.textContent = 'WAVE ' + wave;
+      var s = $('wave-banner-sub');
+      if (s) s.textContent = fruitCount + (fruitCount === 1 ? ' FRUIT' : ' FRUITS') + ' INCOMING!';
+      b.classList.add('show');
+    }
+    function hideWaveBanner() {
+      var b = $('wave-banner');
+      if (b) b.classList.remove('show');
+    }
+    // Launch a pre-announced wave: plan.fruits quota fruits + plan.bombs
+    // extra bombs, slots shuffled so bombs never launch from a fixed spot.
+    function spawnWave(plan) {
       var kinds = [];
       var i;
       for (i = 0; i < plan.bombs; i++) kinds.push('bomb');
@@ -495,7 +545,7 @@
         var j = Math.floor(Math.random() * (i + 1));
         var tmp = kinds[i]; kinds[i] = kinds[j]; kinds[j] = tmp;
       }
-      var d = difficultyAt(t);
+      var d = difficultyForRound(round.round);
       for (i = 0; i < kinds.length; i++) {
         var x = W * (0.1 + Math.random() * 0.8);
         var v = launchVelocity(W, H, x, d.launchBoost, Math.random);
@@ -506,6 +556,7 @@
           fruits.push(makeFruit(key, x, H + 60, v.vx, v.vy, FRUIT_TYPES[key].r * S));
         }
       }
+      round.launched += plan.fruits; // quota counts fruits only; bombs are extra
     }
 
     /* ---------- slashing ---------- */
@@ -596,6 +647,11 @@
         missEl.textContent = marks;
         missEl.classList.toggle('danger', round.misses >= 2);
       }
+      var roundEl = $('hud-round');
+      if (roundEl) {
+        var left = Math.max(0, round.quota - round.resolved);
+        roundEl.textContent = 'ROUND ' + round.round + ' · ' + left + ' LEFT';
+      }
     }
 
     /* ---------- fingertip ---------- */
@@ -657,7 +713,7 @@
         drawAmbient(t, dt);
       } else if (state === 'loading') {
         // DOM covers the screen; keep the canvas calm.
-      } else if (state === 'ready' || state === 'playing' || state === 'over') {
+      } else if (state === 'ready' || state === 'playing' || state === 'over' || state === 'roundcomplete') {
         drawVideoBackground();
         var present = readTip(dt);
         if (state === 'ready') {
@@ -687,28 +743,53 @@
           wasFast = fast;
           // slash check (only while the fingertip is moving fast)
           if (fast && tip.px > -100) slashAt(tip.px, tip.py, tip.x, tip.y, nowMs);
-          // spawn (never after the round is over — no new fruit past the end)
+          // waves: announce first (~1s banner with the exact fruit count),
+          // then launch. Never spawn after the round is over, and never
+          // launch more quota fruits than the round still needs.
           if (!round.over) {
-            spawnTimer -= dt;
-            if (spawnTimer <= 0) {
-              spawnGroup(roundElapsed);
-              spawnTimer = difficultyAt(roundElapsed).spawnInterval;
+            if (pendingWave) {
+              if (nowMs - pendingWave.at >= ANNOUNCE_MS) {
+                hideWaveBanner();
+                spawnWave(pendingWave.plan);
+                pendingWave = null;
+                spawnTimer = difficultyForRound(round.round).spawnInterval;
+                updateHUD();
+              }
+            } else {
+              spawnTimer -= dt;
+              if (spawnTimer <= 0 && round.launched < round.quota) {
+                var plan = planWave(round.round, round.quota - round.launched, Math.random);
+                waveNum += 1;
+                pendingWave = { wave: waveNum, plan: plan, at: nowMs };
+                showWaveBanner(waveNum, plan.fruits);
+              }
             }
           }
-          // physics + misses
+          // physics + misses (only FRUITS count as misses; a bomb falling
+          // off the bottom untouched costs nothing — PRD §3)
           var gravity = GRAVITY_FACTOR * H;
           for (var i = fruits.length - 1; i >= 0; i--) {
             var f = fruits[i];
             updateBody(f, dt, gravity);
             if (isMissed(f, H)) {
               fruits.splice(i, 1);
-              if (registerMiss(round)) endAt = nowMs + 700;
-              updateHUD();
+              if (f.kind === 'fruit') {
+                if (registerMiss(round)) endAt = nowMs + 700;
+                updateHUD();
+              }
             } else if (f.dead) {
               fruits.splice(i, 1);
             }
           }
           if (round.over && !endShown && nowMs >= endAt) showResult();
+          // round complete: every quota fruit launched + resolved, and no
+          // bodies left on screen (a lingering bomb must fall away first —
+          // and the player may still slash it, ending the game, until it does).
+          if (!round.over && !round.complete && isRoundComplete(round) && fruits.length === 0) {
+            round.complete = true;
+            completeAt = nowMs + 500;
+          }
+          if (round.complete && !completeShown && nowMs >= completeAt) showRoundComplete();
           updateHUD();
         }
         // halves + particles always animate while a round is on screen
@@ -845,7 +926,10 @@
       state = 'playing';
       roundStartedAt = nowMs;
       roundElapsed = 0;
-      spawnTimer = 0; // first wave launches the instant play begins
+      spawnTimer = 0; // first wave is announced the instant play begins
+      waveNum = 0;
+      pendingWave = null;
+      hideWaveBanner();
       showScreen('game');
       updateHUD();
     }
@@ -854,14 +938,17 @@
     function showResult() {
       endShown = true;
       state = 'over';
+      hideWaveBanner();
+      bestComboOverall = Math.max(bestComboOverall, round.bestCombo);
       var beaten = saveHighScore(window.localStorage, round.score);
       newBest = beaten;
       if (beaten) highScore = round.score;
       var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
       set('result-score', round.score);
-      set('result-slashed', round.slashed);
-      set('result-combo', round.bestCombo > 1 ? 'x' + round.bestCombo : '—');
+      set('result-slashed', round.totalSlashed);
+      set('result-combo', bestComboOverall > 1 ? 'x' + bestComboOverall : '—');
       set('result-best', highScore);
+      set('result-round', round.round);
       set('result-reason', round.reason === 'bomb'
         ? 'BOOM! You slashed a bomb.'
         : 'Three fruits got past you.');
@@ -871,14 +958,52 @@
       showScreen('result');
     }
 
-    function startGame(nextMode) {
-      mode = nextMode;
-      round = newRound();
+    /* ---------- round complete ---------- */
+    function showRoundComplete() {
+      completeShown = true;
+      state = 'roundcomplete';
+      hideWaveBanner();
+      bestComboOverall = Math.max(bestComboOverall, round.bestCombo);
+      var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+      set('rc-kicker', 'ROUND ' + round.round + ' COMPLETE!');
+      set('rc-score', round.score);
+      set('rc-slashed', round.slashed);
+      set('rc-misses', round.misses);
+      set('rc-combo', round.bestCombo > 1 ? 'x' + round.bestCombo : '—');
+      set('rc-next', 'Round ' + (round.round + 1) + ': ' + roundQuota(round.round + 1) +
+        ' fruits, bigger waves, more bombs.');
+      showScreen('round-complete');
+    }
+    function startNextRound() {
+      var prev = round;
+      bestComboOverall = Math.max(bestComboOverall, prev.bestCombo);
+      round = newRound(prev.round + 1, prev); // score + total slashed carry over
       fruits = []; halves = []; particles = []; trail = [];
       smooth.init = false;
       tip.x = tip.y = -999; tip.present = false; tip.speed = 0;
-      readySince = 0; countdown = null; endShown = false; endAt = 0; boom = null;
+      readySince = 0; countdown = null; endShown = false; completeShown = false;
+      endAt = 0; completeAt = 0; boom = null; newBest = false; wasFast = false;
+      waveNum = 0; pendingWave = null;
+      hideWaveBanner();
+      updateHUD();
+      // Straight into the countdown — the tracker is already warm and the
+      // hand is still up, so no ready screen is needed between rounds.
+      startCountdown(performance.now());
+      setHudActive(true);
+    }
+
+    function startGame(nextMode) {
+      mode = nextMode;
+      round = newRound(1); // fresh run: round 1, score 0
+      bestComboOverall = 0;
+      fruits = []; halves = []; particles = []; trail = [];
+      smooth.init = false;
+      tip.x = tip.y = -999; tip.present = false; tip.speed = 0;
+      readySince = 0; countdown = null; endShown = false; completeShown = false;
+      endAt = 0; completeAt = 0; boom = null;
       newBest = false; wasFast = false;
+      waveNum = 0; pendingWave = null;
+      hideWaveBanner();
       updateHUD();
       if (mode === 'mouse') {
         state = 'ready';
@@ -942,8 +1067,19 @@
     bind('mouse-btn', function () { startGame('mouse'); });
     bind('retry-btn', function () { startGame('camera'); });
     bind('again-btn', function () { startGame(mode); });
+    bind('next-btn', function () { startNextRound(); });
     bind('home-btn', function () {
       state = 'start';
+      pendingWave = null;
+      hideWaveBanner();
+      if (tracker) tracker.pause();
+      showScreen('start');
+      initAmbient();
+    });
+    bind('rc-home-btn', function () {
+      state = 'start';
+      pendingWave = null;
+      hideWaveBanner();
       if (tracker) tracker.pause();
       showScreen('start');
       initAmbient();
@@ -976,13 +1112,16 @@
     SLASH_CHAIN_WINDOW_MS: SLASH_CHAIN_WINDOW_MS,
     MAX_MISSES: MAX_MISSES,
     HIGH_SCORE_KEY: HIGH_SCORE_KEY,
+    ANNOUNCE_MS: ANNOUNCE_MS,
     FRUIT_TYPES: FRUIT_TYPES,
     FRUIT_KEYS: FRUIT_KEYS,
     slashSpeedThreshold: slashSpeedThreshold,
     fruitScale: fruitScale,
     comboBonus: comboBonus,
     scoreForSwipe: scoreForSwipe,
-    difficultyAt: difficultyAt,
+    roundQuota: roundQuota,
+    waveSizeForRound: waveSizeForRound,
+    difficultyForRound: difficultyForRound,
     planWave: planWave,
     segmentHitsCircle: segmentHitsCircle,
     makeFruit: makeFruit,
@@ -990,6 +1129,8 @@
     updateBody: updateBody,
     isMissed: isMissed,
     newRound: newRound,
+    isRoundComplete: isRoundComplete,
+    canAdvance: canAdvance,
     registerSlash: registerSlash,
     registerMiss: registerMiss,
     registerBomb: registerBomb,
