@@ -7,15 +7,21 @@
   /* ============================== config ============================== */
   // Single speed-threshold setting (PRD §3): the fingertip must move faster
   // than this (canvas px per second, scaled to the smaller screen side)
-  // for a swipe to count as a slash. A slow touch does nothing.
-  var SLASH_SPEED_FACTOR = 1.05; // x min(canvasWidth, canvasHeight) per second
+  // for a swipe to count as a slash. 0.7 = a firm swipe, not a lightning
+  // flick — but a slow touch or resting finger (~0-200 px/s) still does
+  // nothing. The 200 floor keeps the threshold above a slow drag on the
+  // smallest screens while letting phones scale down to ~252 px/s.
+  var SLASH_SPEED_FACTOR = 0.7; // x min(canvasWidth, canvasHeight) per second
   var SLASH_CHAIN_WINDOW_MS = 150; // slashes this close together = one swipe
   var MAX_MISSES = 3;
   var HIGH_SCORE_KEY = 'fruitSlashHighScore';
-  var GRAVITY_FACTOR = 1.6; // x canvas height, px/s^2
+  var GRAVITY_FACTOR = 1.15; // x canvas height, px/s^2 (lowered ~28%: slower arcs, longer hang time)
+  var FRUIT_SCALE = 1.45; // fruit + bomb radius multiplier (bigger, juicier targets)
 
   function slashSpeedThreshold(w, h) {
-    return Math.max(350, SLASH_SPEED_FACTOR * Math.min(w, h));
+    // Rounded to whole px/s: 0.7 is not exact in binary, so 0.7*360 would
+    // otherwise come out as 251.99999999999997 instead of 252.
+    return Math.max(200, Math.round(SLASH_SPEED_FACTOR * Math.min(w, h)));
   }
 
   /* ============================ fruit types =========================== */
@@ -35,15 +41,36 @@
 
   // Difficulty ramp (PRD §3): first 10 s gentle, then faster, bigger groups,
   // more bombs. No timer on the round — it ends only by misses or a bomb.
+  // Wave-based spawning: a wave launches several fruits at once, then a
+  // short gap (spawnInterval) before the next wave. Waves get bigger and a
+  // bit faster the longer the round survives.
   function difficultyAt(t) {
     var gentle = t < 10;
     var since = Math.max(0, t - 10);
     return {
-      spawnInterval: gentle ? 1.35 : Math.max(0.55, 1.35 - since * 0.022),
-      groupSize: gentle ? 1 : Math.min(4, 1 + Math.floor(since / 22)),
-      bombChance: gentle ? 0.02 : Math.min(0.16, 0.02 + since * 0.0016),
+      spawnInterval: gentle ? 1.0 : Math.max(0.8, 1.0 - since * 0.006),
+      groupSize: gentle ? 2 : Math.min(6, 2 + Math.floor(since / 15)),
+      bombChance: gentle ? 0.05 : Math.min(0.30, 0.05 + since * 0.004),
       launchBoost: 1 + Math.min(0.25, t * 0.003)
     };
+  }
+
+  // Plan one wave: how many bodies launch, and how many of them are bombs.
+  // Pure (rng injectable) so the harness can test wave composition.
+  // - Early waves are 2-3 bodies; later waves grow to 4-6 (see difficultyAt).
+  // - Bombs are capped at 2 per wave, and most later waves carry at least
+  //   one bomb (a second-chance roll when none was rolled).
+  function planWave(t, rng) {
+    var d = difficultyAt(t);
+    var r = rng || Math.random;
+    var total = d.groupSize;
+    if (t < 10 && r() < 0.5) total += 1; // early waves vary 2-3
+    var bombs = 0;
+    for (var i = 0; i < total; i++) {
+      if (bombs < 2 && r() < d.bombChance) bombs++;
+    }
+    if (t >= 20 && bombs === 0 && r() < 0.7) bombs = 1;
+    return { total: total, bombs: bombs, fruits: total - bombs };
   }
 
   // Does the segment (x1,y1)-(x2,y2) pass through the circle? Used so a
@@ -147,7 +174,7 @@
   }
 
   /* ====================== canvas drawing (fruits) ===================== */
-  function fruitScale(w, h) { return Math.min(w, h) / 800; }
+  function fruitScale(w, h) { return Math.min(w, h) / 800 * FRUIT_SCALE; }
 
   function drawWholeFruit(ctx, typeKey, x, y, r, rot) {
     var t = FRUIT_TYPES[typeKey];
@@ -458,13 +485,21 @@
 
     /* ---------- spawning ---------- */
     function spawnGroup(t) {
+      var plan = planWave(t, Math.random);
+      // Shuffle bomb/fruit slots so bombs never launch from a fixed spot.
+      var kinds = [];
+      var i;
+      for (i = 0; i < plan.bombs; i++) kinds.push('bomb');
+      for (i = 0; i < plan.fruits; i++) kinds.push('fruit');
+      for (i = kinds.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        var tmp = kinds[i]; kinds[i] = kinds[j]; kinds[j] = tmp;
+      }
       var d = difficultyAt(t);
-      var n = d.groupSize;
-      for (var i = 0; i < n; i++) {
+      for (i = 0; i < kinds.length; i++) {
         var x = W * (0.1 + Math.random() * 0.8);
         var v = launchVelocity(W, H, x, d.launchBoost, Math.random);
-        var isBomb = Math.random() < d.bombChance;
-        if (isBomb) {
+        if (kinds[i] === 'bomb') {
           fruits.push(makeBomb(x, H + 60, v.vx, v.vy, 34 * S + 8));
         } else {
           var key = FRUIT_KEYS[Math.floor(Math.random() * FRUIT_KEYS.length)];
@@ -652,11 +687,13 @@
           wasFast = fast;
           // slash check (only while the fingertip is moving fast)
           if (fast && tip.px > -100) slashAt(tip.px, tip.py, tip.x, tip.y, nowMs);
-          // spawn
-          spawnTimer -= dt;
-          if (spawnTimer <= 0) {
-            spawnGroup(roundElapsed);
-            spawnTimer = difficultyAt(roundElapsed).spawnInterval;
+          // spawn (never after the round is over — no new fruit past the end)
+          if (!round.over) {
+            spawnTimer -= dt;
+            if (spawnTimer <= 0) {
+              spawnGroup(roundElapsed);
+              spawnTimer = difficultyAt(roundElapsed).spawnInterval;
+            }
           }
           // physics + misses
           var gravity = GRAVITY_FACTOR * H;
@@ -808,7 +845,7 @@
       state = 'playing';
       roundStartedAt = nowMs;
       roundElapsed = 0;
-      spawnTimer = 0.4;
+      spawnTimer = 0; // first wave launches the instant play begins
       showScreen('game');
       updateHUD();
     }
@@ -934,15 +971,19 @@
   /* ============================ exports ============================= */
   var api = {
     SLASH_SPEED_FACTOR: SLASH_SPEED_FACTOR,
+    FRUIT_SCALE: FRUIT_SCALE,
+    GRAVITY_FACTOR: GRAVITY_FACTOR,
     SLASH_CHAIN_WINDOW_MS: SLASH_CHAIN_WINDOW_MS,
     MAX_MISSES: MAX_MISSES,
     HIGH_SCORE_KEY: HIGH_SCORE_KEY,
     FRUIT_TYPES: FRUIT_TYPES,
     FRUIT_KEYS: FRUIT_KEYS,
     slashSpeedThreshold: slashSpeedThreshold,
+    fruitScale: fruitScale,
     comboBonus: comboBonus,
     scoreForSwipe: scoreForSwipe,
     difficultyAt: difficultyAt,
+    planWave: planWave,
     segmentHitsCircle: segmentHitsCircle,
     makeFruit: makeFruit,
     makeBomb: makeBomb,
