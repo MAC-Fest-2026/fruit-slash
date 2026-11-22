@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b2e1f">
+<title>Fruit Slash — MAC Fest 2026</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<canvas id="game-canvas"></canvas>
+<!-- hidden camera source for hand tracking (playsinline is required on iOS) -->
+<video id="cam-video" playsinline muted autoplay style="display:none"></video>
+<div id="flash"></div>
+
+<!-- HUD (visible during ready / play) -->
+<div id="hud">
+  <div id="hud-misses" class="hud-pill" title="Misses">○○○</div>
+  <div id="hud-score-wrap"><div id="hud-score">0</div><div id="hud-best">BEST 0</div></div>
+  <button id="sound-btn-2" class="hud-pill hud-btn" type="button">SOUND: ON</button>
+</div>
+<div id="combo-pop"></div>
+<div id="countdown"></div>
+
+<!-- START -->
+<section id="screen-start" class="screen active">
+  <div class="panel">
+    <div class="kicker">MAC FEST 2026 &bull; MAR AUGUSTINOS COLLEGE</div>
+    <h1 class="title">FRUIT<br>SLASH</h1>
+    <p class="tagline">Slash the fruit. Dodge the bomb.</p>
+    <p class="how">Wave your finger in the air — the blade follows it.<br>Fast swipes cut. Slow touches do nothing. 3 misses or one bomb ends the round.</p>
+    <button id="play-btn" class="btn btn-big" type="button">▶&ensp;PLAY</button>
+    <button id="mouse-btn" class="btn btn-ghost" type="button">No camera? Play with mouse / touch</button>
+    <div id="start-best" class="best-line">No scores yet today — be the first!</div>
+    <button id="sound-btn" class="btn btn-small" type="button">SOUND: ON</button>
+  </div>
+</section>
+
+<!-- LOADING / CAMERA + MODEL -->
+<section id="screen-loading" class="screen">
+  <div class="panel">
+    <div class="spinner"></div>
+    <h2>Getting ready…</h2>
+    <p id="loading-status">Asking for the camera…</p>
+    <div id="loading-error" class="error-box">
+      <p id="loading-error-msg"></p>
+      <button id="retry-btn" class="btn" type="button">Try the camera again</button>
+      <button id="mouse-btn-2" class="btn btn-ghost" type="button">Play with mouse / touch instead</button>
+    </div>
+  </div>
+</section>
+
+<!-- READY -->
+<section id="screen-ready" class="screen screen-overlay">
+  <div class="ready-box">
+    <h2>READY?</h2>
+    <p id="ready-hint">Raise one hand so the camera can see it.</p>
+    <button id="ready-go" class="btn btn-big" type="button" style="display:none">START SLASHING</button>
+  </div>
+</section>
+
+<!-- RESULT -->
+<section id="screen-result" class="screen">
+  <div class="panel">
+    <div id="result-badge" class="badge">★ NEW HIGH SCORE! ★</div>
+    <h2 id="result-reason">Round over!</h2>
+    <div class="result-score"><span id="result-score">0</span><span class="pts">points</span></div>
+    <div class="result-stats">
+      <div><span id="result-slashed">0</span><label>Fruits slashed</label></div>
+      <div><span id="result-combo">—</span><label>Best combo</label></div>
+      <div><span id="result-best">0</span><label>Today's best</label></div>
+    </div>
+    <button id="again-btn" class="btn btn-big" type="button">↻&ensp;PLAY AGAIN</button>
+    <button id="home-btn" class="btn btn-ghost" type="button">Back to start</button>
+  </div>
+</section>
+
+<script src="js/game.js"></script>
+<script type="module" src="js/tracking.js"></script>
+<script>
+  // The mouse/touch fallback button inside the error box (kept in HTML so it
+  // works even before game.js wires its own handlers).
+  document.getElementById('mouse-btn-2').addEventListener('click', function () {
+    document.getElementById('mouse-btn').click();
+  });
+</script>
+</body>
+</html>
