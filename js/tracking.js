@@ -13,6 +13,14 @@
   var MODEL_PATH = new URL('assets/model/hand_landmarker.task', document.baseURI).href;
   var WASM_PATH = new URL('assets/model/wasm/', document.baseURI).href;
   var WORKER_URL = new URL('js/tracking-worker.js', document.baseURI).href;
+  // Perf: the worker gets at most one frame per 66 ms (~15 fps) and the
+  // frame is downscaled to 320x240 first — a quarter of the pixels to copy,
+  // transfer and run inference on. The main-thread fallback runs at most
+  // one inference per 100 ms: a phone-CPU detectForVideo can block the
+  // main thread 100-200 ms, which froze the whole page every frame.
+  var DETECT_W = 320, DETECT_H = 240;
+  var WORKER_SUBMIT_MIN_MS = 66; // ~15 fps
+  var MAIN_DETECT_MIN_MS = 100; // 10 fps
 
   function Tracker() {
     this.video = null;
@@ -21,6 +29,10 @@
     this.engine = 'none'; // 'worker' | 'main'
     this.workerBusy = false;
     this.workerReady = false;
+    this.lastWorkerSubmit = 0; // throttle: at most ~15 fps to the worker
+    this.lastMainDetect = 0; // throttle: at most 10 fps on the main thread
+    this.smallCanvas = null; // 320x240 downscale target for worker frames
+    this.smallCtx = null;
     this.landmarker = null; // main-thread fallback engine
     this.tip = { x: 0.5, y: 0.5, present: false, at: 0 };
     this.running = false;
@@ -150,13 +162,25 @@
     this.rafId = requestAnimationFrame(function () { self.loop(); });
     var video = this.video;
     if (!video || video.readyState < 2 || !video.videoWidth) return;
-    var ts = Math.round(performance.now() * 1000);
+    var nowMs = performance.now();
+    var ts = Math.round(nowMs * 1000);
     if (ts <= this.lastTs) ts = this.lastTs + 1;
     this.lastTs = ts;
     if (this.engine === 'worker') {
       if (this.workerBusy || !this.workerReady) return; // skip stale frame
+      if (nowMs - this.lastWorkerSubmit < WORKER_SUBMIT_MIN_MS) return; // ~15 fps cap
+      this.lastWorkerSubmit = nowMs;
       this.workerBusy = true;
-      createImageBitmap(video).then(function (bitmap) {
+      if (!this.smallCanvas) {
+        this.smallCanvas = document.createElement('canvas');
+        this.smallCanvas.width = DETECT_W;
+        this.smallCanvas.height = DETECT_H;
+        this.smallCtx = this.smallCanvas.getContext('2d');
+      }
+      try {
+        this.smallCtx.drawImage(video, 0, 0, DETECT_W, DETECT_H);
+      } catch (e) { this.workerBusy = false; return; }
+      createImageBitmap(this.smallCanvas).then(function (bitmap) {
         if (!self.running) { bitmap.close(); self.workerBusy = false; return; }
         try {
           self.worker.postMessage({ type: 'frame', bitmap: bitmap, timestamp: ts }, [bitmap]);
@@ -166,6 +190,11 @@
         }
       }).catch(function () { self.workerBusy = false; });
     } else if (this.engine === 'main' && this.landmarker) {
+      // Never every frame: one synchronous detectForVideo on a phone CPU
+      // blocks the main thread 100-200 ms. At most one per 100 ms; the
+      // game's eased tip interpolation covers the gaps.
+      if (nowMs - this.lastMainDetect < MAIN_DETECT_MIN_MS) return;
+      this.lastMainDetect = nowMs;
       try {
         var res = this.landmarker.detectForVideo(video, ts);
         var lm = res && res.landmarks && res.landmarks[0];

@@ -18,6 +18,7 @@
   var GRAVITY_FACTOR = 1.6; // x canvas height, px/s^2 (original fast fall; hang time ~2.1s)
   var FRUIT_SCALE = 1.45; // fruit + bomb radius multiplier (bigger, juicier targets)
   var ANNOUNCE_MS = 1000; // wave banner shows for ~1s before the wave launches
+  var MAX_PARTICLES = 120; // cap on live juice/explosion particles (mobile perf)
   // Rounds, not slower fruit, make the game last longer: each round has a
   // fixed quota of fruits to clear. Round 1 = 15 fruits, +5 per round.
   // Wave sizes: round 1 waves carry 3 fruits, +2 per round, capped at 20.
@@ -201,6 +202,46 @@
   /* ====================== canvas drawing (fruits) ===================== */
   function fruitScale(w, h) { return Math.min(w, h) / 800 * FRUIT_SCALE; }
 
+  /* ---- gradient cache (perf): gradients are built ONCE per fruit type +
+     radius and reused every frame. Creating a new gradient per fruit per
+     frame churns the GC and costs GPU time on phones. A gradient's
+     coordinates live in the user space at fill time, so the same cached
+     gradient is correct under any translate/rotate. Keyed by type + rounded
+     radius (radius already encodes the current scale S). */
+  var gradientCache = {};
+  function fruitGradient(ctx, typeKey, r) {
+    var key = typeKey + ':' + Math.round(r);
+    var g = gradientCache[key];
+    if (g) return g;
+    var t = FRUIT_TYPES[typeKey];
+    var rx = t.kind === 'lemon' ? r * 1.28 : r;
+    var ry = t.kind === 'lemon' ? r * 0.82 : r;
+    g = ctx.createRadialGradient(-rx * 0.35, -ry * 0.4, r * 0.1, 0, 0, r * 1.15);
+    g.addColorStop(0, t.body[0]);
+    g.addColorStop(1, t.body[1]);
+    gradientCache[key] = g;
+    return g;
+  }
+  function bombGradient(ctx, r) {
+    var key = 'bomb:' + Math.round(r);
+    var g = gradientCache[key];
+    if (g) return g;
+    g = ctx.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.1, 0, 0, r * 1.1);
+    g.addColorStop(0, '#4a4a4a');
+    g.addColorStop(0.6, '#212121');
+    g.addColorStop(1, '#000000');
+    gradientCache[key] = g;
+    return g;
+  }
+  var bladeTipGradient = null; // built once, reused (knife-local coords)
+  function bladeTipGradientFor(ctx) {
+    if (bladeTipGradient) return bladeTipGradient;
+    bladeTipGradient = ctx.createLinearGradient(0, -7, 0, 7);
+    bladeTipGradient.addColorStop(0, '#ffffff');
+    bladeTipGradient.addColorStop(1, '#90a4ae');
+    return bladeTipGradient;
+  }
+
   function drawWholeFruit(ctx, typeKey, x, y, r, rot) {
     var t = FRUIT_TYPES[typeKey];
     if (!t) return;
@@ -209,11 +250,8 @@
     ctx.rotate(rot);
     var rx = t.kind === 'lemon' ? r * 1.28 : r;
     var ry = t.kind === 'lemon' ? r * 0.82 : r;
-    // body
-    var g = ctx.createRadialGradient(-rx * 0.35, -ry * 0.4, r * 0.1, 0, 0, r * 1.15);
-    g.addColorStop(0, t.body[0]);
-    g.addColorStop(1, t.body[1]);
-    ctx.fillStyle = g;
+    // body (cached gradient — no per-frame allocation)
+    ctx.fillStyle = fruitGradient(ctx, typeKey, r);
     ctx.beginPath();
     ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
     ctx.fill();
@@ -350,12 +388,8 @@
     ctx.closePath(); ctx.fill();
     ctx.fillStyle = '#ff6d00';
     ctx.beginPath(); ctx.arc(sx, sy, sp * 0.4, 0, Math.PI * 2); ctx.fill();
-    // body
-    var g = ctx.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.1, 0, 0, r * 1.1);
-    g.addColorStop(0, '#4a4a4a');
-    g.addColorStop(0.6, '#212121');
-    g.addColorStop(1, '#000000');
-    ctx.fillStyle = g;
+    // body (cached gradient — no per-frame allocation)
+    ctx.fillStyle = bombGradient(ctx, r);
     ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
     // skull-ish warning dot + shine
     ctx.fillStyle = 'rgba(255,255,255,0.28)';
@@ -375,13 +409,20 @@
     ctx.save();
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
+    // No shadow blur: on mobile GPUs it forces an offscreen pass per stroke.
+    // The glow is faked with a wide faint cyan halo stroke under the white
+    // core stroke — same look, two plain strokes instead.
     for (var i = 1; i < trail.length; i++) {
       var p0 = trail[i - 1], p1 = trail[i];
       var f = i / trail.length; // 0 = tail, 1 = tip
+      ctx.strokeStyle = 'rgba(120, 220, 255,' + (0.05 + 0.22 * f) + ')';
+      ctx.lineWidth = 2 + 13 * f + 10;
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
       ctx.strokeStyle = 'rgba(255, 255, 255,' + (0.12 + 0.85 * f) + ')';
       ctx.lineWidth = 2 + 13 * f;
-      ctx.shadowColor = 'rgba(120, 220, 255, 0.9)';
-      ctx.shadowBlur = 10 * f;
       ctx.beginPath();
       ctx.moveTo(p0.x, p0.y);
       ctx.lineTo(p1.x, p1.y);
@@ -391,13 +432,9 @@
     var tip = trail[trail.length - 1];
     var prev = trail[trail.length - 2];
     var ang = Math.atan2(tip.y - prev.y, tip.x - prev.x);
-    ctx.shadowBlur = 0;
     ctx.translate(tip.x, tip.y);
     ctx.rotate(ang);
-    var bg = ctx.createLinearGradient(0, -7, 0, 7);
-    bg.addColorStop(0, '#ffffff');
-    bg.addColorStop(1, '#90a4ae');
-    ctx.fillStyle = bg;
+    ctx.fillStyle = bladeTipGradientFor(ctx);
     ctx.beginPath();
     ctx.moveTo(0, 0);
     ctx.quadraticCurveTo(26, -9, 52, -3);
@@ -417,8 +454,17 @@
     var video = $('cam-video');
 
     var W = 0, H = 0, DPR = 1, S = 1; // CSS-pixel viewport size + fruit scale
+    var bgGradient = null; // cached per resize (was rebuilt every frame)
+    function buildBackgroundGradient() {
+      bgGradient = ctx.createLinearGradient(0, 0, 0, H);
+      bgGradient.addColorStop(0, '#0b2e1f');
+      bgGradient.addColorStop(0.55, '#0f3d26');
+      bgGradient.addColorStop(1, '#071a10');
+    }
     function resize() {
-      DPR = Math.min(window.devicePixelRatio || 1, 2);
+      // DPR cap 1.5 (was 2): a phone at DPR 2-3 would rasterise ~10M px per
+      // frame; 1.5 is ~44% fewer pixels with no visible loss at game sizes.
+      DPR = Math.min(window.devicePixelRatio || 1, 1.5);
       W = window.innerWidth;
       H = window.innerHeight;
       canvas.width = Math.round(W * DPR);
@@ -427,6 +473,7 @@
       canvas.style.height = H + 'px';
       ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
       S = fruitScale(W, H);
+      buildBackgroundGradient();
     }
     window.addEventListener('resize', resize);
     window.addEventListener('orientationchange', function () { setTimeout(resize, 120); });
@@ -475,7 +522,12 @@
       if (hr) hr.classList.toggle('active', on);
     }
     function setStatus(text) { var el = $('loading-status'); if (el) el.textContent = text; }
-    function setReadyHint(text) { var el = $('ready-hint'); if (el) el.textContent = text; }
+    var lastHint = null; // setReadyHint runs every frame in ready state; only write on change
+    function setReadyHint(text) {
+      if (text === lastHint) return;
+      lastHint = text;
+      var el = $('ready-hint'); if (el) el.textContent = text;
+    }
 
     /* ---------- sounds ---------- */
     var sounds = {};
@@ -575,9 +627,9 @@
           playSound('bomb', 1);
           flashScreen();
           endAt = nowMs + 1100; // let the explosion show before the result
-          spawnBurst(f.x, f.y, '#ff6d00', 26, 420);
-          spawnBurst(f.x, f.y, '#ffd60a', 18, 320);
-          spawnBurst(f.x, f.y, '#616161', 14, 220);
+          spawnBurst(f.x, f.y, '#ff6d00', 18, 420);
+          spawnBurst(f.x, f.y, '#ffd60a', 12, 320);
+          spawnBurst(f.x, f.y, '#616161', 10, 220);
         } else {
           var res = registerSlash(round, nowMs);
           playSound('splat', 0.9);
@@ -586,7 +638,7 @@
             showCombo(res.chain);
           }
           splitFruit(f, x2 - x1, y2 - y1);
-          spawnBurst(f.x, f.y, FRUIT_TYPES[f.type].juice, 12, 260);
+          spawnBurst(f.x, f.y, FRUIT_TYPES[f.type].juice, 8, 260);
         }
       }
       return hitAny;
@@ -607,7 +659,11 @@
       }
     }
     function spawnBurst(x, y, color, n, speed) {
-      for (var i = 0; i < n; i++) {
+      // Cap total live particles: bursts beyond the cap add nothing.
+      var room = MAX_PARTICLES - particles.length;
+      if (room <= 0) return;
+      var count = Math.min(n, room);
+      for (var i = 0; i < count; i++) {
         var a = Math.random() * Math.PI * 2;
         var v = speed * (0.3 + Math.random() * 0.7);
         particles.push({
@@ -635,22 +691,40 @@
     }
 
     /* ---------- HUD ---------- */
+    // Change-gated: updateHUD runs every frame in the playing state, so it
+    // only touches the DOM when a value actually changed.
+    var hudCache = { score: null, best: null, misses: null, danger: null, round: null };
     function updateHUD() {
-      var scoreEl = $('hud-score');
-      if (scoreEl) scoreEl.textContent = round.score;
-      var bestEl = $('hud-best');
-      if (bestEl) bestEl.textContent = 'BEST ' + Math.max(highScore, round.score);
-      var missEl = $('hud-misses');
-      if (missEl) {
-        var marks = '';
-        for (var i = 0; i < MAX_MISSES; i++) marks += i < round.misses ? '✕' : '○';
-        missEl.textContent = marks;
-        missEl.classList.toggle('danger', round.misses >= 2);
+      if (round.score !== hudCache.score) {
+        hudCache.score = round.score;
+        var scoreEl = $('hud-score');
+        if (scoreEl) scoreEl.textContent = round.score;
       }
-      var roundEl = $('hud-round');
-      if (roundEl) {
-        var left = Math.max(0, round.quota - round.resolved);
-        roundEl.textContent = 'ROUND ' + round.round + ' · ' + left + ' LEFT';
+      var best = Math.max(highScore, round.score);
+      if (best !== hudCache.best) {
+        hudCache.best = best;
+        var bestEl = $('hud-best');
+        if (bestEl) bestEl.textContent = 'BEST ' + best;
+      }
+      var marks = '';
+      for (var i = 0; i < MAX_MISSES; i++) marks += i < round.misses ? '✕' : '○';
+      if (marks !== hudCache.misses) {
+        hudCache.misses = marks;
+        var missEl = $('hud-misses');
+        if (missEl) missEl.textContent = marks;
+      }
+      var danger = round.misses >= 2;
+      if (danger !== hudCache.danger) {
+        hudCache.danger = danger;
+        var missEl2 = $('hud-misses');
+        if (missEl2) missEl2.classList.toggle('danger', danger);
+      }
+      var left = Math.max(0, round.quota - round.resolved);
+      var roundText = 'ROUND ' + round.round + ' · ' + left + ' LEFT';
+      if (roundText !== hudCache.round) {
+        hudCache.round = roundText;
+        var roundEl = $('hud-round');
+        if (roundEl) roundEl.textContent = roundText;
       }
     }
 
@@ -706,15 +780,21 @@
       lastFrameAt = nowMs;
       var t = nowMs / 1000;
 
-      ctx.clearRect(0, 0, W, H);
-      drawBackground(t);
+      // No full clear: the background fill (or the video frame in camera
+      // mode) is opaque and covers the whole canvas every frame, so
+      // clearing first would be a wasted full-screen pass.
+      // In gameplay with the camera on, the video IS the background — the
+      // gradient fill underneath it is skipped. Everywhere else (start,
+      // loading, mouse mode, game over) the gradient is painted.
+      var inGame = state === 'ready' || state === 'playing' || state === 'over' || state === 'roundcomplete';
+      if (!inGame || !videoVisible()) drawBackground(t);
 
       if (state === 'start') {
         drawAmbient(t, dt);
       } else if (state === 'loading') {
         // DOM covers the screen; keep the canvas calm.
       } else if (state === 'ready' || state === 'playing' || state === 'over' || state === 'roundcomplete') {
-        drawVideoBackground();
+        if (mode === 'camera') drawVideoBackground(); // mouse mode: static background only
         var present = readTip(dt);
         if (state === 'ready') {
           drawTipMarker();
@@ -805,11 +885,8 @@
     }
 
     function drawBackground(t) {
-      var g = ctx.createLinearGradient(0, 0, 0, H);
-      g.addColorStop(0, '#0b2e1f');
-      g.addColorStop(0.55, '#0f3d26');
-      g.addColorStop(1, '#071a10');
-      ctx.fillStyle = g;
+      if (!bgGradient) buildBackgroundGradient();
+      ctx.fillStyle = bgGradient;
       ctx.fillRect(0, 0, W, H);
     }
     function drawAmbient(t, dt) {
@@ -822,8 +899,11 @@
       }
       ctx.globalAlpha = 1;
     }
+    function videoVisible() {
+      return mode === 'camera' && video && video.readyState >= 2 && video.videoWidth;
+    }
     function drawVideoBackground() {
-      if (mode === 'camera' && video && video.readyState >= 2 && video.videoWidth) {
+      if (videoVisible()) {
         ctx.save();
         ctx.translate(W, 0);
         ctx.scale(-1, 1); // mirrored so the blade moves the way the hand moves
@@ -836,10 +916,15 @@
     function drawTipMarker() {
       if (!tip.present) return;
       ctx.save();
+      // Two plain circles instead of a shadow blur: a wide faint halo + the
+      // bright ring. Same glow look, no offscreen pass.
+      ctx.strokeStyle = 'rgba(125, 216, 255, 0.4)';
+      ctx.lineWidth = 7;
+      ctx.beginPath();
+      ctx.arc(tip.x, tip.y, 20 * S + 8, 0, Math.PI * 2);
+      ctx.stroke();
       ctx.strokeStyle = 'rgba(255,255,255,0.9)';
       ctx.lineWidth = 2.5;
-      ctx.shadowColor = '#7dd8ff';
-      ctx.shadowBlur = 14;
       ctx.beginPath();
       ctx.arc(tip.x, tip.y, 20 * S + 8, 0, Math.PI * 2);
       ctx.stroke();
@@ -890,23 +975,36 @@
       }
       ctx.globalAlpha = 1;
     }
+    // Explosion glow, pre-rendered once to an offscreen sprite and drawn
+    // scaled — no per-frame gradient creation.
+    var boomSprite = null;
+    function getBoomSprite() {
+      if (boomSprite) return boomSprite;
+      var c = document.createElement('canvas');
+      c.width = 256; c.height = 256;
+      var bctx = c.getContext('2d');
+      var g = bctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+      g.addColorStop(0, 'rgba(255, 240, 120, 0.95)');
+      g.addColorStop(0.4, 'rgba(255, 109, 0, 0.75)');
+      g.addColorStop(1, 'rgba(255, 60, 0, 0)');
+      bctx.fillStyle = g;
+      bctx.fillRect(0, 0, 256, 256);
+      boomSprite = c;
+      return boomSprite;
+    }
     function drawBoom(nowMs) {
       var age = (nowMs - boom.at) / 1000;
       if (age > 0.7) { boom = null; return; }
       var r = (0.2 + age * 2.4) * Math.min(W, H) * 0.32;
-      var g = ctx.createRadialGradient(boom.x, boom.y, 0, boom.x, boom.y, r);
-      g.addColorStop(0, 'rgba(255, 240, 120, 0.95)');
-      g.addColorStop(0.4, 'rgba(255, 109, 0, 0.75)');
-      g.addColorStop(1, 'rgba(255, 60, 0, 0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(boom.x, boom.y, r, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.drawImage(getBoomSprite(), boom.x - r, boom.y - r, r * 2, r * 2);
     }
+    var lastCountdownN = -1; // only write the DOM when the number changes
     function drawCountdown(nowMs) {
       var step = Math.floor((nowMs - countdown.at) / 550);
-      if (step >= 3) { countdown = null; beginPlay(nowMs); return; }
+      if (step >= 3) { countdown = null; lastCountdownN = -1; beginPlay(nowMs); return; }
       var n = 3 - step;
+      if (n === lastCountdownN) return;
+      lastCountdownN = n;
       var el = $('countdown');
       if (el) {
         el.textContent = n;
@@ -1113,6 +1211,7 @@
     MAX_MISSES: MAX_MISSES,
     HIGH_SCORE_KEY: HIGH_SCORE_KEY,
     ANNOUNCE_MS: ANNOUNCE_MS,
+    MAX_PARTICLES: MAX_PARTICLES,
     FRUIT_TYPES: FRUIT_TYPES,
     FRUIT_KEYS: FRUIT_KEYS,
     slashSpeedThreshold: slashSpeedThreshold,
