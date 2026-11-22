@@ -10,16 +10,24 @@ and the camera tracking uses the phone front camera too.
 
 ## Rules
 
+- **Rounds:** each round has a fixed quota of fruits to clear — Round 1 is
+  15 fruits, then +5 per round (20, 25, 30, …). Before every wave, a banner
+  announces exactly how many fruits are coming ("WAVE 2 — 5 FRUITS
+  INCOMING!"). Wave sizes grow with the round (3, 5, 7, 9, …, max 20).
+- Clear a round with **2 misses or fewer** to advance to the next round —
+  harder each time (bigger waves, faster launches, more bombs). Score
+  carries over between rounds.
 - Slash fruit with your finger: **+1 point** per fruit.
 - **Combo:** 2 or more fruits in one swipe earn a bonus — 2 fruits in one
   swipe = 3 points, 3 fruits = 5 points.
 - A fruit only counts when your fingertip is moving **fast** — a slow touch
   does nothing (one speed-threshold setting in `js/game.js`).
 - A fruit that falls off the bottom unsliced is a **miss**. Three misses
-  ends the round.
-- Slash a **bomb** and the round ends on the spot. A bomb that falls
+  ends the game.
+- Slash a **bomb** and the game ends on the spot. A bomb that falls
   untouched costs nothing.
-- No timer — a round ends only by 3 misses or a bomb.
+- No timer — a game ends only by 3 misses or a bomb. Rounds get longer
+  because the quota grows, not because the fruit slows down.
 - The day's high score is kept on the stall device (`localStorage`).
 
 ## How it works
@@ -48,9 +56,9 @@ and the camera tracking uses the phone front camera too.
 ## Files
 
 ```
-index.html            the whole game page (5 screens + HUD)
+index.html            the whole game page (6 screens + HUD)
 css/style.css         responsive styles (phone + desktop, safe-area, dvh)
-js/game.js            canvas loop, fruits, physics, scoring, screens
+js/game.js            canvas loop, rounds, waves, physics, scoring, screens
 js/tracking.js        camera + HandLandmarker setup (worker / fallback)
 js/tracking-worker.js hand tracking inside the Web Worker
 assets/model/         hand_landmarker.task + vision_bundle.mjs + wasm/
